@@ -206,4 +206,194 @@ final boolean nonfairTryAcquire(int acquires) {
 
 ## 3 ReentrantReadWriteLock
 
+​	虽然ReentrantLock在处理多线程安全问题提供了锁机制，但是ReentrantLock是独占锁，某一时刻只有一个线程可以获取该锁，在读多写少的场景不能多线程同时读，显然ReentrantLock满足不了这个需求，所以ReentrantReadWriteLock应运而生。ReentrantReadWriteLock包含读锁和写锁并采用读写分离的策略，允许多个线程可以同时获取读锁，在读多写少的场景比一般的排他锁有了很大提升。
+
+### 3.1 ReentrantReadWriteLock常用示例
+
+**存钱和查询余额**
+
+```java
+    private final ReentrantReadWriteLock readWriteLock = new ReentrantReadWriteLock();
+    private final ReentrantReadWriteLock.ReadLock readLock = readWriteLock.readLock();
+    private final ReentrantReadWriteLock.WriteLock writeLock = readWriteLock.writeLock();
+    private long balance;
+
+    public void deposit(int amount) {
+        writeLock.lock();
+        try {
+            balance += amount;
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    public void getDeposit() {
+        readLock.lock();
+        try {
+            // 查询逻辑
+        } finally {
+            readLock.unlock();
+        }
+    }
+```
+
+### 3.2 ReentrantReadWriteLock特性
+
+- 公平性选择：和ReentrantLock类似，支持非公平（默认）和公平的锁获取模式；
+- 重入性：支持重入，读写锁最多支持 65535 个递归写锁和 65535 个递归读锁；
+- 读锁和写锁互斥性：读锁和读锁共享；写锁和写锁互斥；读锁和写锁互斥（锁降级除外）；
+- 锁降级：遵循获取写锁，获取读锁再释放写锁的次序，写锁能够降级为读锁；
+
+### 3.3 读写锁状态设计
+
+​	ReentranReadWriteLock中使用一个int state变量（32位）来维护读锁和写锁的状态。state的高16位来存储读锁的状态，低16位来存储写锁的状态。
+
+![img](./images/2.png)
+
+#### 3.3.1 读锁位运算操作
+
+- 读取：无符号右移16位, state >>>16；
+- 写入：每次获取读锁成功在高位+1，所以读锁计数**基本单位**是1的高16位，即1左移16位（1 << 16）；
+
+#### 3.3.2 写锁位运算操作
+
+- 读取：使用与运算屏蔽高16位，state & EXCLUSIVE_MASK，EXCLUSIVE_MASK为(1 << 16) - 1
+
+  1 << SHARED_SHIFT二进制为：0000 0000 0000 0001 0000 0000 0000 0000
+
+  (1 << SHARED_SHIFT) - 1二进制为：0000 0000 0000 0000 1111 1111 1111 1111
+
+- 写入：直接加计数；
+
+#### 3.3.3 为何使用一个变量管理两个锁状态？
+
+- 如果使用两个int变量，会增加同步复杂度，需要实现同时原子性更新两个变量，通常CAS操作单次针对1个变量操作；效率没单个变量位运算高；
+- 使用对象封装两个int变量：增加对象的创建和同步字段，没有只同步一个int变量效率高；
+
+### 以下以非公平锁分析：
+
+### 3.4 读锁
+
+#### 3.4.1 读线程尝试获取锁
+
+##### 3.4.1.1 读锁获取失败（阻塞策略）
+
+​	与ReentrantLock锁机制不同，ReentrantLock非公平锁可以CAS插队，ReentrantReadWriteLock读线程需要兼顾写锁的占用和写线程等待情况：
+
+- 写锁已被占用：当其它线程在持有写锁时，此时新的读锁线程需放弃读锁获取（读写锁互斥），已持有写锁线程除外（锁降级）；
+- 等待队列头是写线程：检查队列头是否为写线程，如果队列队列为写线程并且不是当前线程持有，弃读本次放锁获取，确保写线程有机会获取锁，而非被大量读线程无限插队；
+
+##### 3.4.1.2 获取到读锁（无写锁占用、等待队列头不是写线程）
+
+​	当写锁没被占用，队列头不是写线程，通过CAS修改state读锁数量，支持多个线程同时获取读锁：
+
+- 读锁重入：线程计数信息计数加1；
+- 读锁共享：ThreadLocal存储每个线程计数信息，ThreadLocal<HoldCounter>（锁计数和线程id）；
+
+##### 3.4.1.3 读锁减少ThreadLocal的使用
+
+针对热点数据单独做两个优化：
+
+- 首个读线程处理：不使用ThreadLocal，使用两个字段存储Thread对象和锁计数；
+- 缓存最新一个读线程HoldCounter对象实例（除开首个读线程），命中时减少对ThreadLocal的访问，不命中时操作ThreadLocal；
+
+#### 3.4.2 读锁处理排队逻辑
+
+##### 3.4.2.1 将线程封装成Node插入到队列尾部
+
+​	与ReentrantLock机制类似，通过AQS队列机制增加等待Node
+
+##### 3.4.2.2 读锁逐步唤醒机制
+
+​	获取读锁时如果进入了阻塞，当被唤醒时会继续尝试排队获取锁逻辑，如果成功获取到锁，会继续唤醒下一线程，是一个链式逐步唤醒唤醒的过程，即使等待队列阻塞的都是读线程，每次都只多唤醒一个线程，而非尝试一次性唤醒所有读线程，逐步唤醒和一次性唤醒所有读线程对比：
+
+|              | 逐步唤醒    | 尝试一次性唤醒所有读线程                       |
+| ------------ | ----------- | ---------------------------------------------- |
+| 锁状态争用   | 减少CAS竞争 | 可能会存在CAS失败                              |
+| 业务资源争用 | 低          | 可能会存在同时大量耗时操作（如读数据库）       |
+| 响应时间抖动 | 波动小      | 部分线程无法及时获取到锁时可能业务逻辑延迟突增 |
+| 系统负载突增 | 平稳增长    | 可能瞬间过载                                   |
+
+##### 3.4.2.3 读线程进入阻塞
+
+​	与ReentrantLock机制类似
+
+#### 3.4.3 读锁unlock释放锁
+
+​	当所有读锁释放完成，通过AQS unparkSuccessor唤醒下一阻塞线程
+
+### 3.5 写锁
+
+#### 3.5.1 写线程尝试获取锁
+
+##### 3.5.5.1 写锁获取失败（阻塞策略）
+
+- 读锁已被占用；
+- 写锁已被其它线程占用；
+
+#### 3.5.2 写锁处理排队逻辑
+
+​	与ReentrantLock机制类似
+
+#### 3.5.3 写锁unlock释放锁
+
+​	当写锁释放完成，通过AQS unparkSuccessor唤醒下一阻塞线程
+
+### 3.6 锁降级
+
+​	ReentrantReadWriteLock自身不提供锁降级接口，可在保持写锁的情况下获取读锁，然后释放写锁的过程，必须严格按照锁降级操作步骤，否则可能导致线程阻塞，死锁。
+
+**步骤**
+
+1. 保持写锁：`writeLock.lock()`
+2. 获取读锁：`readLock.lock()`
+3. 释放写锁：`writeLock.unlock()`
+4. 保持读锁：继续执行读操作
+
+**示例**
+
+```java
+    /**
+     * 交易状态变更
+     */
+    public void changeTransactionState(int state) {
+        writeLock.lock();
+        try {
+            this.state = state;
+        } finally {
+            readLock.lock();
+            writeLock.unlock();
+        }
+        try {
+            // 变更交易状态广播
+            broadTransactionState(state);
+        } finally {
+            readLock.unlock();
+        }
+    }
+```
+
+**优点**
+
+- 避免不必要的阻塞，其它读线程在操作完成后并发读取，提高整体吞吐量；
+- 此时读锁操作不受其它写线程干扰
+
+**示例适用场景**
+
+- 多线程协作的生产者-消费者模型中，写入者在生产数据后需立即读取数据分发，防止消费者在写锁释放后没有先读到本次生产数据；
+
+**是否有锁升级？读锁升级写锁？**
+
+​	线程获取到读锁时，可能有其他线程同时已持有读锁，此时lock获取写锁将会失败，线程进入阻塞状态，无锁降低天然获取到写锁时可以降级读锁
+
+### 3.7 ReentrantLock和ReentrantReadWriteLock对比
+
+| 特性/功能        | ReentrantLock                                  | ReentrantReadWriteLock                 |
+| ---------------- | ---------------------------------------------- | -------------------------------------- |
+| 锁类型           | 独占锁（写锁）                                 | 独占锁（写锁）+ 共享锁（读锁）         |
+| 读写均衡场景性能 | 中                                             | 高（读操作并发性强）                   |
+| 写多读少场景性能 | 高（无读锁管理开销）                           | 低（写操作需要等待读锁释放，存在竞争） |
+| 锁降级           | 无                                             | 支持                                   |
+| 适用场景         | 高频写操作，少读或无读场景，例如数据库事务提交 | 读多写少场景                           |
+
 ## 4 synchronized
